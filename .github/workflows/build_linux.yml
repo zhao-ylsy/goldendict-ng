@@ -1,0 +1,110 @@
+name: Linux Build & Release
+env:
+  version: 25.04.0
+  prerelease: ${{ !contains(github.ref_name,'master') }}
+  versionSuffix: ${{ !contains(github.ref_name,'master') && 'alpha' || 'Release' }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+      - master
+      - experimental
+    paths-ignore:
+      - 'docs/**'
+      - "howto/**"
+      - "*.md"
+      - ".clang-format"
+
+jobs:
+  build_linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            libavformat-dev libavutil-dev libbz2-dev \
+            libeb16-dev libhunspell-dev liblzma-dev \
+            liblzo2-dev libopencc-dev libvorbis-dev \
+            libx11-dev libxtst-dev libzim-dev libzstd-dev \
+            qt6-5compat-dev qt6-base-dev qt6-multimedia-dev \
+            qt6-speech-dev qt6-svg-dev qt6-tools-dev \
+            qt6-tools-dev-tools qt6-webchannel-dev \
+            qt6-webengine-dev x11proto-record-dev \
+            zlib1g-dev autoconf automake libtool
+
+      - name: Build and install eb library
+        run: |
+          git clone https://github.com/xiaoyifang/eb.git
+          cd eb && ./configure && make -j$(nproc) && sudo make install
+
+      - name: Configure project
+        run: |
+          cmake -S . -B build_dir -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+
+      - name: Build project
+        run: cmake --build build_dir --parallel $(nproc)
+
+      - name: Create installation package
+        run: |
+          mkdir -p package/usr/local
+          DESTDIR=$(pwd)/package cmake --install build_dir
+          tar -czvf goldendict-linux.tar.gz -C package usr
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: goldendict-linux.tar.gz
+          retention-days: 3
+
+  generate_metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      newTag: ${{ steps.getNewTag.outputs.newTag }}
+      releaseTitle: ${{ steps.getReleaseTitle.outputs.releaseTitle }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version tag
+        id: getNewTag
+        run: |
+          sha_short=$(git rev-parse --short HEAD)
+          new_tag="v${{ env.version }}-${{ env.versionSuffix }}.$sha_short"
+          echo "newTag=$new_tag" >> $GITHUB_OUTPUT
+
+      - name: Generate release title
+        id: getReleaseTitle
+        run: |
+          if [[ '${{ env.prerelease }}' == 'true' ]]; then
+            title="Nightly Build $new_tag"
+          else
+            title="Stable Release $new_tag"
+          fi
+          echo "releaseTitle=$title" >> $GITHUB_OUTPUT
+
+  publish_release:
+    needs: [build_linux, generate_metadata]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-build
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ needs.generate_metadata.outputs.newTag }} \
+            --title "${{ needs.generate_metadata.outputs.releaseTitle }}" \
+            --notes "Linux build of GoldenDict NG (${{ github.sha }})\nBranch: ${{ github.ref_name }}" \
+            --prerelease=${{ env.prerelease }} \
+            goldendict-linux.tar.gz

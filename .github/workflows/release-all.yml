@@ -1,0 +1,213 @@
+name: Release All
+env: 
+  version: 25.04.0
+  prerelease: ${{ !contains(github.ref_name,'master') }}
+  versionSuffix: ${{ !contains(github.ref_name,'master') && 'alpha' || 'Release' }}
+on: 
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+      - master
+      - experimental
+    paths-ignore:
+      - 'docs/**'
+      - "howto/**"
+      - "*.md"
+      - ".clang-format"
+jobs:
+  build_macOS:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]
+        qt_ver: [6.6.3, 6.7.2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Update brew
+        run: brew update
+      - name: Install dependencies
+        run: |
+          brew install --force --overwrite \
+            bzip2 create-dmg hunspell libiconv \
+            libogg libvorbis libzim lzip ninja \
+            opencc xapian
+      - name: Install eb
+        run: |
+          git clone https://github.com/xiaoyifang/eb.git
+          cd eb && ./configure && make -j8 && sudo make install
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt_ver }}
+          arch: clang_64
+          modules: qtwebengine qtwebchannel qtpositioning qt5compat qtmultimedia qtimageformats qtspeech
+      - name: Build
+        run: |
+          mkdir build_dir
+          cmake -S . -B build_dir -G Ninja \
+            -DWITH_FFMPEG_PLAYER=OFF \
+            -DWITH_TTS=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="12.0"
+          cmake --build build_dir
+      - name: Package
+        run: cmake --install build_dir
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS-${{ matrix.os }}-Qt${{ matrix.qt_ver }}
+          path: '*.dmg'
+          retention-days: 7
+
+  build_Windows:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        qt_ver: [6.6.3, 6.7.2]
+    steps:
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt_ver }}
+          arch: win64_msvc2019_64
+          modules: qtwebengine qtwebchannel qtpositioning qt5compat qtmultimedia qtimageformats qtspeech
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build
+        run: |
+          & "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1" -SkipAutomaticLocation
+          cmake -S . -B build_dir -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWITH_FFMPEG_PLAYER=OFF \
+            -DWITH_VCPKG_BREAKPAD=ON
+          cmake --build build_dir
+      - name: Package
+        run: |
+          cd build_dir
+          cpack --verbose
+          cd ..
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows-Qt${{ matrix.qt_ver }}
+          path: |
+            ./build_dir/*.exe
+            ./build_dir/*.7z
+            ./build_dir/*.pdb
+          retention-days: 7
+
+  build_linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavformat-dev libavutil-dev libbz2-dev \
+            libeb16-dev libhunspell-dev liblzma-dev \
+            liblzo2-dev libopencc-dev libvorbis-dev \
+            libx11-dev libxtst-dev libzim-dev libzstd-dev \
+            qt6-5compat-dev qt6-base-dev qt6-multimedia-dev \
+            qt6-speech-dev qt6-svg-dev qt6-tools-dev \
+            qt6-tools-dev-tools qt6-webchannel-dev \
+            qt6-webengine-dev x11proto-record-dev \
+            zlib1g-dev autoconf automake libtool
+      - name: Build eb library
+        run: |
+          git clone https://github.com/xiaoyifang/eb.git
+          cd eb && ./configure && make -j$(nproc) && sudo make install
+      - name: Configure and build
+        run: |
+          cmake -S . -B build_dir -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build_dir --parallel $(nproc)
+      - name: Create install package
+        run: |
+          mkdir -p package/usr/local
+          DESTDIR=$(pwd)/package cmake --install build_dir
+          tar -czvf goldendict-linux.tar.gz -C package usr
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Linux-Build
+          path: goldendict-linux.tar.gz
+          retention-days: 7
+
+  generate_other_staffs:
+    runs-on: ubuntu-latest
+    outputs:
+      newTag: ${{ steps.getNewTag.outputs.newTag }}
+      releaseTitle: ${{ steps.getReleaseTitle.outputs.releaseTitle }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get short SHA
+        id: shortSHA
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Get previous tag
+        id: changelogTags
+        run: |
+          if [[ '${{env.prerelease}}' == 'true' ]]; then
+            prev_tag=$(git tag --sort=-creatordate | grep -v Release | head -1)
+          else
+            prev_tag=$(git tag --sort=-creatordate | grep Release | head -1)
+          fi
+          echo "prev_tag=$prev_tag" >> $GITHUB_OUTPUT
+      - name: Generate new tag
+        id: getNewTag
+        run: |
+          new_tag="v${{ env.version }}-${{ env.versionSuffix }}.${{ steps.shortSHA.outputs.sha_short }}"
+          echo "newTag=$new_tag" >> $GITHUB_OUTPUT
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: ${{ steps.changelogTags.outputs.prev_tag }}..HEAD
+        env:
+          OUTPUT: changelog.txt
+      - name: Append branch info
+        run: echo "Branch: ${{ github.ref_name }}" >> changelog.txt
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog.txt
+          path: changelog.txt
+
+  publish:
+    needs: [build_macOS, build_Windows, build_linux, generate_other_staffs]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_title="${{ needs.generate_other_staffs.outputs.releaseTitle }}"
+          new_tag="${{ needs.generate_other_staffs.outputs.newTag }}"
+          
+          release_args=(
+            "$new_tag"
+            --title "$release_title"
+            --notes-file changelog.txt
+            --target ${{ github.ref_name }}
+          )
+
+          if [[ '${{ env.prerelease }}' == 'true' ]]; then
+            release_args+=(--prerelease)
+          else
+            release_args+=(--latest)
+          fi
+
+          gh release create "${release_args[@]}" || echo "Release creation failed"
+
+          # Upload all artifacts
+          gh release upload "$new_tag" \
+            --clobber \
+            *.dmg *.exe *.7z *.pdb *.tar.gz
